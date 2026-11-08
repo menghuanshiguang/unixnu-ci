@@ -36,6 +36,10 @@ on:
         description: Optional shell commands run in the UniXNU checkout before the kernel build
         required: false
         default: ""
+      boot_check:
+        description: 'Run the built payload under HVF/TCG and keep the serial log and screenshots'
+        type: boolean
+        default: false
       os_root:
         description: Build the iPadOS userland path (OS root chain, qemu_root_defconfig, OS/SystemOS images)
         type: boolean
@@ -218,7 +222,9 @@ jobs:
           # prepare-xnu-source.py lists Apple sources through the GitHub API; anonymous calls from hosted runners hit
           # the shared rate limit (HTTP 403).
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./unixnu build kernel
+        run: |
+          ./unixnu defconfig "$DEFCONFIG"
+          ./unixnu build kernel
 
       - name: Build userdata
         id: userdata
@@ -241,20 +247,44 @@ jobs:
           ( cd out/qemu/tree && python3 scripts/build-darwinboot-efi.py && python3 scripts/build-qemu-ramfb-efi.py )
           ./unixnu build payload
           ./unixnu ipsw fetch || true
+          grep -n "getRefreshAttributes" -r build/display-abi 2>/dev/null | head -5 || true
+          find . -name 'IOMobileFramebuffer*' -maxdepth 6 2>/dev/null | head -10
           url=$(python3 -c "import re,pathlib;print(re.search(r'^url\s*=\s*\"([^\"]+)\"', pathlib.Path('device/board.toml').read_text(), re.M).group(1))")
           echo "IPSW $url"
           curl -fL --retry 3 --retry-delay 2 "$url" -o "$RUNNER_TEMP/ipsw.ipsw"
           ls -la "$RUNNER_TEMP/ipsw.ipsw"
           df -h "$GITHUB_WORKSPACE"
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path('out/qemu/tree/drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp')
+          if not p.is_file():
+              print('abi-patch: driver missing, skip'); sys.exit(0)
+          s = p.read_text()
+          start = s.find('    bool getRefreshAttributes(uint64_t *words,bool fixed) override {')
+          nl = chr(10)
+          want = '    bool getRefreshAttributes(uint64_t *words,bool fixed) override {'
+          start = s.find(want)
+          if start == -1:
+              print('abi-patch: no getRefreshAttributes override in this revision'); sys.exit(0)
+          end = s.find(nl + "    }" + nl, start)
+          if end == -1:
+              print('abi-patch: could not find the end of the method'); sys.exit(1)
+          s = s[:start] + s[end + len(nl + "    }" + nl):]
+          p.write_text(s)
+          print('abi-patch: removed the getRefreshAttributes override')
+          PY
           ( cd out/qemu/tree && python3 scripts/build-os-root.py --ipsw "$RUNNER_TEMP/ipsw.ipsw" )
-          uuid=$(python3 -c "import json;print(json.load(open('../device/.cache/firmware/owner-data/seed.json'))['volume_uuid'])")
+          uuid=$(python3 -c "import json;print(json.load(open('out/qemu/tree/.cache/firmware/owner-data/seed.json'))['volume_uuid'])")
           echo "XNU_OWNER_DATA_VOLUME_UUID=$uuid" >> "$GITHUB_ENV"
+          export XNU_OWNER_DATA_VOLUME_UUID="$uuid"
           ./unixnu defconfig qemu_root_defconfig
           ./unixnu build kernel
+          ./unixnu build payload --trust-cache out/qemu/tree/build/original-static-system-trust/original-static-system.bundle --data-ramdisk out/qemu/tree/.cache/firmware/owner-data/owner-data-1g.dbr || true
           mkdir -p out/os-root
-          cp -r ../device/.cache/firmware/target-volumes out/os-root/ || true
-          cp -r ../device/.cache/firmware/owner-data out/os-root/ || true
-          cp -r ../device/.cache/platform-seed out/os-root/ 2>/dev/null || true
+          cp -r out/qemu/tree/.cache/firmware/target-volumes out/os-root/ || true
+          cp -r out/qemu/tree/.cache/firmware/owner-data out/os-root/ || true
+          cp -r out/qemu/tree/.cache/platform-seed out/os-root/ 2>/dev/null || true
           cp -r out/qemu/tree/build/original-static-system-trust out/os-root/ 2>/dev/null || true
           du -sh out/os-root/* || true
 
@@ -297,11 +327,33 @@ jobs:
           if [ ! -f "$RUNNER_TEMP/trustcache" ] && [ -f out/qemu/tree/build/original-static-system-trust/original-static-system.bundle ]; then
             args+=(--trust-cache out/qemu/tree/build/original-static-system-trust/original-static-system.bundle)
           fi
-          if [ ! -f "$RUNNER_TEMP/data.dbr" ] && [ -f ../device/.cache/firmware/owner-data/owner-data-1g.dbr ]; then
-            args+=(--data-ramdisk ../device/.cache/firmware/owner-data/owner-data-1g.dbr)
+          if [ ! -f "$RUNNER_TEMP/data.dbr" ] && [ -f out/qemu/tree/.cache/firmware/owner-data/owner-data-1g.dbr ]; then
+            args+=(--data-ramdisk out/qemu/tree/.cache/firmware/owner-data/owner-data-1g.dbr)
           fi
           if [ -n "${UNIXNU_UNIQUE_CHIP_ID:-}" ]; then args+=(--unique-chip-id "$UNIXNU_UNIQUE_CHIP_ID"); fi
           ./unixnu build payload "${args[@]}"
+
+      - name: Boot check under this runner
+        if: inputs.boot_check
+        run: |
+          set -ux
+          cd out/qemu/tree
+          python3 scripts/run-qemu.py --os-root --display none --seconds 420 --every 90 || true
+          ls -la out/qemu/run/* 2>/dev/null | head -20 || true
+          find out/qemu/run -name '*.log' -o -name '*.png' 2>/dev/null | head -20 || true
+
+
+      - name: Publish to the private repository
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.ARTIFACT_PAT }}
+        run: |
+          set -ux
+          tag="build-${{ github.run_id }}"
+          gh release create "$tag" --repo menghuanshiguang/UniXNU-build --title "build ${{ github.run_id }}" --notes "from ${{ github.repository }} run ${{ github.run_id }}" || true
+          for f in             $(find out -type f -name kernel.macho -o -type f -name kernel.json -o -type f -name payload.img -o -type f -name payload.json -o -type f -name UniXNU.efi -o -type f -name DarwinBoot.efi -o -type f -name QemuRamfb.efi -o -type f -path '*os-root/target-volumes/*.json' -o -type f -path 'out/qemu/run/*')             $(find out/qemu/run -type f 2>/dev/null | head -60); do
+            gh release upload "$tag" "$f" --repo menghuanshiguang/UniXNU-build --clobber || true
+          done
 
       - name: Collect the text logs
         id: logs
@@ -338,29 +390,6 @@ jobs:
               count += 1
           print(f'{count} text logs staged')
           PY
-
-      - name: Upload the build logs
-        if: always() && steps.logs.outcome == 'success'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: unixnu-${{ steps.check.outputs.board }}-logs-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/public-logs/*.log
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload build outputs
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: unixnu-${{ steps.check.outputs.board }}-out-${{ github.run_attempt }}
-          path: |
-            out/**/payload/**
-            out/**/boot/**
-            out/**/kernel/**
-            out/**/package/Build/Out/**
-            out/**/os-root/**
-          if-no-files-found: warn
-          retention-days: 1
 
       - name: Summary
         if: always()
