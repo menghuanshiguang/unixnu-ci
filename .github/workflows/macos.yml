@@ -36,6 +36,10 @@ on:
         description: Optional shell commands run in the UniXNU checkout before the kernel build
         required: false
         default: ""
+      os_root:
+        description: Build the iPadOS userland path (OS root chain, qemu_root_defconfig, OS/SystemOS images)
+        type: boolean
+        default: false
       trust_cache_url:
         description: Trust cache bundle URL (optional; masked in the logs)
         required: false
@@ -223,6 +227,55 @@ jobs:
           ./unixnu build userdata
           df -h "$GITHUB_WORKSPACE"
 
+      - name: Build OS root chain
+        id: osroot
+        if: inputs.os_root
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          set -eux
+          ./unixnu defconfig qemu_defconfig
+          ./unixnu build kernel
+          ./unixnu build package
+          ( cd out/qemu/tree && python3 scripts/build-darwinboot-efi.py && python3 scripts/build-qemu-ramfb-efi.py )
+          ./unixnu build payload
+          ./unixnu ipsw fetch || true
+          url=$(python3 -c "import re,pathlib;print(re.search(r'^url\s*=\s*\"([^\"]+)\"', pathlib.Path('device/board.toml').read_text(), re.M).group(1))")
+          echo "IPSW $url"
+          curl -fL --retry 3 --retry-delay 2 "$url" -o "$RUNNER_TEMP/ipsw.ipsw"
+          ls -la "$RUNNER_TEMP/ipsw.ipsw"
+          df -h "$GITHUB_WORKSPACE"
+          ( cd out/qemu/tree && python3 scripts/build-os-root.py --ipsw "$RUNNER_TEMP/ipsw.ipsw" )
+          uuid=$(python3 -c "import json;print(json.load(open('../device/.cache/firmware/owner-data/seed.json'))['volume_uuid'])")
+          echo "XNU_OWNER_DATA_VOLUME_UUID=$uuid" >> "$GITHUB_ENV"
+          ./unixnu defconfig qemu_root_defconfig
+          ./unixnu build kernel
+          mkdir -p out/os-root
+          cp -r ../device/.cache/firmware/target-volumes out/os-root/ || true
+          cp -r ../device/.cache/firmware/owner-data out/os-root/ || true
+          cp -r ../device/.cache/platform-seed out/os-root/ 2>/dev/null || true
+          cp -r out/qemu/tree/build/original-static-system-trust out/os-root/ 2>/dev/null || true
+          du -sh out/os-root/* || true
+
+      - name: Build package
+        id: package
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./unixnu build package
+          find out -path '*package/Build/Out*' -maxdepth 8 -type f | head -40
+
+      - name: Build EFI drivers
+        if: contains(inputs.steps, 'payload')
+        run: |
+          cd out/*/tree
+          python3 scripts/build-darwinboot-efi.py
+          python3 scripts/build-qemu-ramfb-efi.py
+          mkdir -p ../boot
+          cp build/darwinboot-efi/DarwinBoot.efi build/qemu-ramfb-efi/QemuRamfb.efi ../boot/
+          ls -la ../boot
+
       - name: Build payload
         id: payload
         if: contains(inputs.steps, 'payload')
@@ -241,6 +294,13 @@ jobs:
           fi
           if [ -f "$RUNNER_TEMP/data.dbr" ]; then args+=(--data-ramdisk "$RUNNER_TEMP/data.dbr"); fi
           if [ "$SKIP_SETUP" = true ]; then args+=(--skip-setup); fi
+          if [ ! -f "$RUNNER_TEMP/trustcache" ] && [ -f out/qemu/tree/build/original-static-system-trust/original-static-system.bundle ]; then
+            args+=(--trust-cache out/qemu/tree/build/original-static-system-trust/original-static-system.bundle)
+          fi
+          if [ ! -f "$RUNNER_TEMP/data.dbr" ] && [ -f ../device/.cache/firmware/owner-data/owner-data-1g.dbr ]; then
+            args+=(--data-ramdisk ../device/.cache/firmware/owner-data/owner-data-1g.dbr)
+          fi
+          if [ -n "${UNIXNU_UNIQUE_CHIP_ID:-}" ]; then args+=(--unique-chip-id "$UNIXNU_UNIQUE_CHIP_ID"); fi
           ./unixnu build payload "${args[@]}"
 
       - name: Collect the text logs
@@ -287,6 +347,20 @@ jobs:
           path: ${{ runner.temp }}/public-logs/*.log
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Upload build outputs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-${{ steps.check.outputs.board }}-out-${{ github.run_attempt }}
+          path: |
+            out/**/payload/**
+            out/**/boot/**
+            out/**/kernel/**
+            out/**/package/Build/Out/**
+            out/**/os-root/**
+          if-no-files-found: warn
+          retention-days: 1
 
       - name: Summary
         if: always()
